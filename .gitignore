@@ -1,0 +1,10 @@
+.DS_Store
+
+# the built binary
+customls
+!customls/
+
+# Go build cruft
+*.exe
+*.test
+*.out
