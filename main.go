@@ -100,6 +100,30 @@ func getTermWidth() int {
 	return w
 }
 
+// displayWidth counts terminal columns rather than bytes. Accented letters
+// are multi-byte but one column; CJK and emoji runes draw as two columns.
+// This is the usual wcwidth approximation, close enough for a file listing.
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		switch {
+		case (r >= 0x1100 && r <= 0x115F) || // Hangul Jamo
+			(r >= 0x2E80 && r <= 0xA4CF) || // CJK radicals through Yi
+			(r >= 0xAC00 && r <= 0xD7A3) || // Hangul syllables
+			(r >= 0xF900 && r <= 0xFAFF) || // CJK compatibility ideographs
+			(r >= 0xFE30 && r <= 0xFE6F) || // CJK compatibility forms
+			(r >= 0xFF00 && r <= 0xFF60) || // fullwidth forms
+			(r >= 0xFFE0 && r <= 0xFFE6) ||
+			(r >= 0x1F300 && r <= 0x1FAFF) || // emoji
+			(r >= 0x20000 && r <= 0x2FFFD): // CJK extension B+
+			w += 2
+		default:
+			w++
+		}
+	}
+	return w
+}
+
 func colorize(name string, isDir bool, cfg Config) string {
 	if customColor, ok := cfg.Colors[name]; ok {
 		if code, ok2 := colorCodes[customColor]; ok2 {
@@ -111,7 +135,7 @@ func colorize(name string, isDir bool, cfg Config) string {
 	return name
 }
 
-func listDir(dir string, cfg Config) {
+func listDir(dir string, cfg Config, showAll bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "customls: %v\n", err)
@@ -125,9 +149,10 @@ func listDir(dir string, cfg Config) {
 
 	var items []item
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), ".") {
-			items = append(items, item{name: e.Name(), isDir: e.IsDir()})
+		if !showAll && strings.HasPrefix(e.Name(), ".") {
+			continue
 		}
+		items = append(items, item{name: e.Name(), isDir: e.IsDir()})
 	}
 	if cfg.OrderByColor {
 		sort.SliceStable(items, func(i, j int) bool {
@@ -149,8 +174,8 @@ func listDir(dir string, cfg Config) {
 
 	maxLen := 0
 	for _, it := range items {
-		if len(it.name) > maxLen {
-			maxLen = len(it.name)
+		if w := displayWidth(it.name); w > maxLen {
+			maxLen = w
 		}
 	}
 
@@ -180,7 +205,7 @@ func listDir(dir string, cfg Config) {
 			if isLast {
 				fmt.Println(display)
 			} else {
-				padding := colWidth - len(it.name)
+				padding := colWidth - displayWidth(it.name)
 				if padding < 1 {
 					padding = 1
 				}
@@ -288,7 +313,7 @@ func interactiveSet(dir string, cfg Config) Config {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
-		fmt.Println("\n  Select an item to colorize:\n")
+		fmt.Print("\n  Select an item to colorize:\n\n")
 		for i, it := range items {
 			marker := "  "
 			if color, ok := cfg.Colors[it.name]; ok {
@@ -380,6 +405,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  (none)     List directory with custom colors")
+	fmt.Println("  -a         Include hidden files")
 	fmt.Println("  -l         Long format with custom colors")
 	fmt.Println("  -al        Long format including hidden files")
 	fmt.Println("  set        Interactively assign colors to items")
@@ -398,11 +424,17 @@ func main() {
 	cfg := loadConfig()
 
 	if len(os.Args) < 2 {
-		listDir(".", cfg)
+		listDir(".", cfg, false)
 		return
 	}
 
 	switch os.Args[1] {
+	case "-a":
+		dir := "."
+		if len(os.Args) > 2 {
+			dir = os.Args[2]
+		}
+		listDir(dir, cfg, true)
 	case "-l":
 		dir := "."
 		if len(os.Args) > 2 {
@@ -422,7 +454,7 @@ func main() {
 		}
 		cfg = interactiveSet(dir, cfg)
 		fmt.Println()
-		listDir(dir, cfg)
+		listDir(dir, cfg, false)
 	case "colors":
 		showColors(cfg)
 	case "order":
@@ -431,6 +463,6 @@ func main() {
 		printUsage()
 	default:
 		// Treat as a path
-		listDir(os.Args[1], cfg)
+		listDir(os.Args[1], cfg, false)
 	}
 }
