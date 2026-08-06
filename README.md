@@ -20,6 +20,7 @@ Or wherever you keep your user binaries.
 
 ```bash
 customls              # list the current directory
+customls -a           # include hidden files
 customls -l           # long format (perm, size, mtime)
 customls -al          # long format including hidden files
 customls /some/path   # list another directory
