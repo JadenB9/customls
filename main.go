@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 )
+
+// Filled in by goreleaser (-X main.version=...). Stays "dev" for go build.
+var version = "dev"
 
 const resetCode = "\033[0m"
 const defaultDirColor = "\033[1;36m" // cyan for dirs
@@ -45,6 +49,15 @@ type Config struct {
 	OrderByColor bool              `json:"order_by_color"`
 }
 
+// colorNames is the list of valid names, in the order they're shown.
+func colorNames() []string {
+	names := make([]string, len(colorOptions))
+	for i, c := range colorOptions {
+		names[i] = c.name
+	}
+	return names
+}
+
 // colorRank returns a sort key: colored items get their color name (so same
 // colors group together), default-colored dirs get "~dir", plain files get
 // "~~file". The tilde prefixes push them after named colors alphabetically.
@@ -63,13 +76,20 @@ func configPath() string {
 	return filepath.Join(home, ".config", "customls", "colors.json")
 }
 
+// loadConfig reads colors.json. A missing file just means nothing is set yet.
+// A file that won't parse gets a warning on stderr instead of silently losing
+// every color, which is what used to happen after a typo.
 func loadConfig() Config {
-	cfg := Config{Colors: make(map[string]string)}
+	empty := Config{Colors: make(map[string]string)}
 	data, err := os.ReadFile(configPath())
 	if err != nil {
-		return cfg
+		return empty
 	}
-	json.Unmarshal(data, &cfg)
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "customls: ignoring %s: %v\n", configPath(), err)
+		return empty
+	}
 	if cfg.Colors == nil {
 		cfg.Colors = make(map[string]string)
 	}
@@ -84,6 +104,22 @@ func saveConfig(cfg Config) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
+}
+
+// isTerminal reports whether f is attached to a terminal rather than a pipe
+// or a file.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// useColor follows the usual rules: no escape codes when piped somewhere, and
+// none when NO_COLOR is set (https://no-color.org).
+func useColor() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	return isTerminal(os.Stdout)
 }
 
 func getTermWidth() int {
@@ -124,62 +160,90 @@ func displayWidth(s string) int {
 	return w
 }
 
-func colorize(name string, isDir bool, cfg Config) string {
-	if customColor, ok := cfg.Colors[name]; ok {
-		if code, ok2 := colorCodes[customColor]; ok2 {
+// colorize wraps a name in its escape code. An unknown color name in the
+// config falls back to the default, so a typo doesn't make a dir go plain.
+func colorize(name string, isDir bool, cfg Config, color bool) string {
+	if !color {
+		return name
+	}
+	if custom, ok := cfg.Colors[name]; ok {
+		if code, ok2 := colorCodes[custom]; ok2 {
 			return code + name + resetCode
 		}
-	} else if isDir {
+	}
+	if isDir {
 		return defaultDirColor + name + resetCode
 	}
 	return name
 }
 
-func listDir(dir string, cfg Config, showAll bool) {
-	entries, err := os.ReadDir(dir)
+type item struct {
+	name  string
+	isDir bool
+	info  os.FileInfo
+}
+
+// readItems lists what's at path. A directory gives its entries; a plain file
+// gives just that file, the same way ls does.
+func readItems(path string, showAll bool) ([]item, error) {
+	st, err := os.Stat(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "customls: %v\n", err)
-		os.Exit(1)
+		return nil, err
+	}
+	if !st.IsDir() {
+		return []item{{name: path, isDir: false, info: st}}, nil
 	}
 
-	type item struct {
-		name  string
-		isDir bool
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
 	}
-
 	var items []item
 	for _, e := range entries {
 		if !showAll && strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		items = append(items, item{name: e.Name(), isDir: e.IsDir()})
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		items = append(items, item{name: e.Name(), isDir: e.IsDir(), info: info})
 	}
-	if cfg.OrderByColor {
-		sort.SliceStable(items, func(i, j int) bool {
-			ri, rj := colorRank(items[i].name, items[i].isDir, cfg), colorRank(items[j].name, items[j].isDir, cfg)
-			if ri != rj {
-				return ri < rj
-			}
-			return strings.ToLower(items[i].name) < strings.ToLower(items[j].name)
-		})
-	} else {
-		sort.Slice(items, func(i, j int) bool {
-			return strings.ToLower(items[i].name) < strings.ToLower(items[j].name)
-		})
-	}
+	return items, nil
+}
 
+// sortItems orders case-insensitively, grouping by color first when that's on.
+func sortItems(items []item, cfg Config) {
+	byName := func(i, j int) bool {
+		return strings.ToLower(items[i].name) < strings.ToLower(items[j].name)
+	}
+	if !cfg.OrderByColor {
+		sort.Slice(items, byName)
+		return
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		ri, rj := colorRank(items[i].name, items[i].isDir, cfg), colorRank(items[j].name, items[j].isDir, cfg)
+		if ri != rj {
+			return ri < rj
+		}
+		return byName(i, j)
+	})
+}
+
+// printGrid lays items out column-major: fill top-to-bottom, then the next
+// column, so reading down keeps alphabetical order.
+func printGrid(w io.Writer, items []item, cfg Config, termWidth int, color bool) {
 	if len(items) == 0 {
 		return
 	}
 
 	maxLen := 0
 	for _, it := range items {
-		if w := displayWidth(it.name); w > maxLen {
-			maxLen = w
+		if dw := displayWidth(it.name); dw > maxLen {
+			maxLen = dw
 		}
 	}
 
-	termWidth := getTermWidth()
 	colWidth := maxLen + 2
 	if colWidth < 4 {
 		colWidth = 4
@@ -188,8 +252,6 @@ func listDir(dir string, cfg Config, showAll bool) {
 	if numCols < 1 {
 		numCols = 1
 	}
-
-	// Column-major layout: fill top-to-bottom, then next column
 	numRows := (len(items) + numCols - 1) / numCols
 
 	for row := 0; row < numRows; row++ {
@@ -199,79 +261,43 @@ func listDir(dir string, cfg Config, showAll bool) {
 				break
 			}
 			it := items[idx]
-			display := colorize(it.name, it.isDir, cfg)
+			display := colorize(it.name, it.isDir, cfg, color)
 
 			isLast := col == numCols-1 || (col+1)*numRows+row >= len(items)
 			if isLast {
-				fmt.Println(display)
+				fmt.Fprintln(w, display)
 			} else {
 				padding := colWidth - displayWidth(it.name)
 				if padding < 1 {
 					padding = 1
 				}
-				fmt.Print(display + strings.Repeat(" ", padding))
+				fmt.Fprint(w, display+strings.Repeat(" ", padding))
 			}
 		}
 	}
 }
 
-func listDirLong(dir string, cfg Config, showAll bool) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "customls: %v\n", err)
-		os.Exit(1)
+// printLines is one name per line, for -1 and for piped output.
+func printLines(w io.Writer, items []item, cfg Config, color bool) {
+	for _, it := range items {
+		fmt.Fprintln(w, colorize(it.name, it.isDir, cfg, color))
 	}
+}
 
-	type fileItem struct {
-		name    string
-		isDir   bool
-		info    os.FileInfo
-	}
-
-	var items []fileItem
-	for _, e := range entries {
-		if !showAll && strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		items = append(items, fileItem{name: e.Name(), isDir: e.IsDir(), info: info})
-	}
-	if cfg.OrderByColor {
-		sort.SliceStable(items, func(i, j int) bool {
-			ri, rj := colorRank(items[i].name, items[i].isDir, cfg), colorRank(items[j].name, items[j].isDir, cfg)
-			if ri != rj {
-				return ri < rj
-			}
-			return strings.ToLower(items[i].name) < strings.ToLower(items[j].name)
-		})
-	} else {
-		sort.Slice(items, func(i, j int) bool {
-			return strings.ToLower(items[i].name) < strings.ToLower(items[j].name)
-		})
-	}
-
-	if len(items) == 0 {
-		return
-	}
-
-	// Find max size width for alignment
+// printLong is the -l format: permissions, size, mtime, name.
+func printLong(w io.Writer, items []item, cfg Config, color bool) {
 	maxSize := 0
 	for _, it := range items {
-		s := len(formatSize(it.info.Size()))
-		if s > maxSize {
+		if s := len(formatSize(it.info.Size())); s > maxSize {
 			maxSize = s
 		}
 	}
-
 	for _, it := range items {
 		perm := it.info.Mode().String()
 		size := formatSize(it.info.Size())
 		mod := it.info.ModTime().Format("Jan _2 15:04")
-		display := colorize(it.name, it.isDir, cfg)
-		fmt.Printf("%s  %*s  %s  %s\n", perm, maxSize, size, mod, display)
+		display := colorize(it.name, it.isDir, cfg, color)
+		fmt.Fprintf(w, "%s  %*s  %s  %s\n", perm, maxSize, size, mod, display)
 	}
 }
 
@@ -288,16 +314,38 @@ func formatSize(bytes int64) string {
 	}
 }
 
+// listOpts is what the flags turn into.
+type listOpts struct {
+	all  bool // -a  include dotfiles
+	long bool // -l  long format
+	one  bool // -1  one per line
+}
+
+// list prints path with the given options to w. Piped output gets one name
+// per line with no color, like ls, so `customls | grep` behaves.
+func list(w io.Writer, path string, cfg Config, opts listOpts, color bool, termWidth int) error {
+	items, err := readItems(path, opts.all)
+	if err != nil {
+		return err
+	}
+	sortItems(items, cfg)
+
+	switch {
+	case opts.long:
+		printLong(w, items, cfg, color)
+	case opts.one || !isTerminal(os.Stdout):
+		printLines(w, items, cfg, color)
+	default:
+		printGrid(w, items, cfg, termWidth, color)
+	}
+	return nil
+}
+
 func interactiveSet(dir string, cfg Config) Config {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "customls: %v\n", err)
 		os.Exit(1)
-	}
-
-	type item struct {
-		name  string
-		isDir bool
 	}
 
 	var items []item
@@ -373,17 +421,35 @@ func interactiveSet(dir string, cfg Config) Config {
 	}
 }
 
-func showColors(cfg Config) {
+// showColors prints the color table in name order. Entries that name a color
+// that doesn't exist are flagged, since the only other hint is the dir
+// quietly losing its color.
+func showColors(w io.Writer, cfg Config, color bool) {
 	if len(cfg.Colors) == 0 {
-		fmt.Println("  No custom colors set. Run 'customls set' to add some.")
+		fmt.Fprintln(w, "  No custom colors set. Run 'customls set' to add some.")
 		return
 	}
-	fmt.Println("\n  Custom colors:")
-	for name, color := range cfg.Colors {
-		code := colorCodes[color]
-		fmt.Printf("  %s%-20s%s  %s\n", code, name, resetCode, color)
+	names := make([]string, 0, len(cfg.Colors))
+	for name := range cfg.Colors {
+		names = append(names, name)
 	}
-	fmt.Println()
+	sort.Strings(names)
+
+	fmt.Fprintln(w, "\n  Custom colors:")
+	for _, name := range names {
+		c := cfg.Colors[name]
+		code, known := colorCodes[c]
+		if !known {
+			fmt.Fprintf(w, "  %-20s  %s  (unknown color, pick from: %s)\n", name, c, strings.Join(colorNames(), ", "))
+			continue
+		}
+		if color {
+			fmt.Fprintf(w, "  %s%-20s%s  %s\n", code, name, resetCode, c)
+		} else {
+			fmt.Fprintf(w, "  %-20s  %s\n", name, c)
+		}
+	}
+	fmt.Fprintln(w)
 }
 
 func toggleOrder(cfg Config) Config {
@@ -401,68 +467,106 @@ func toggleOrder(cfg Config) Config {
 }
 
 func printUsage() {
-	fmt.Println("Usage: customls [command|flags] [path]")
+	fmt.Println("Usage: customls [flags] [path]")
+	fmt.Println("       customls <command> [path]")
+	fmt.Println()
+	fmt.Println("Flags (combine them: -al, -l1):")
+	fmt.Println("  -a         Include hidden files")
+	fmt.Println("  -l         Long format (perm, size, mtime)")
+	fmt.Println("  -1         One entry per line")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  (none)     List directory with custom colors")
-	fmt.Println("  -a         Include hidden files")
-	fmt.Println("  -l         Long format with custom colors")
-	fmt.Println("  -al        Long format including hidden files")
 	fmt.Println("  set        Interactively assign colors to items")
 	fmt.Println("  colors     Show all custom color assignments")
 	fmt.Println("  order      Toggle sorting by color (on/off)")
+	fmt.Println("  version    Show version")
 	fmt.Println("  help       Show this help message")
+	fmt.Println()
+	fmt.Println("Output is one per line with no color when piped. Set NO_COLOR")
+	fmt.Println("to turn color off everywhere. Colors live in")
+	fmt.Println("  " + configPath())
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  customls              List current directory")
-	fmt.Println("  customls -l           Long listing with colors")
+	fmt.Println("  customls -la ~        Long listing of home, dotfiles too")
 	fmt.Println("  customls order        Toggle color ordering")
 	fmt.Println("  customls set          Pick items to colorize")
 }
 
-func main() {
-	cfg := loadConfig()
+// parseArgs sorts the command line into a command (or "" to list), flags,
+// and a path. Flags and the path can come in any order.
+func parseArgs(args []string) (cmd string, opts listOpts, path string, err error) {
+	for _, a := range args {
+		switch a {
+		case "help", "--help", "-h":
+			return "help", opts, "", nil
+		case "version", "--version", "-v":
+			return "version", opts, "", nil
+		case "set", "colors", "order":
+			if cmd != "" {
+				return "", opts, "", fmt.Errorf("one command at a time (got %s and %s)", cmd, a)
+			}
+			cmd = a
+			continue
+		}
 
-	if len(os.Args) < 2 {
-		listDir(".", cfg, false)
-		return
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			for _, ch := range a[1:] {
+				switch ch {
+				case 'a':
+					opts.all = true
+				case 'l':
+					opts.long = true
+				case '1':
+					opts.one = true
+				default:
+					return "", opts, "", fmt.Errorf("unknown flag -%c (try customls help)", ch)
+				}
+			}
+			continue
+		}
+
+		if path != "" {
+			return "", opts, "", fmt.Errorf("one path at a time (got %s and %s)", path, a)
+		}
+		path = a
+	}
+	return cmd, opts, path, nil
+}
+
+func main() {
+	cmd, opts, path, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "customls: %v\n", err)
+		os.Exit(2)
+	}
+	if path == "" {
+		path = "."
 	}
 
-	switch os.Args[1] {
-	case "-a":
-		dir := "."
-		if len(os.Args) > 2 {
-			dir = os.Args[2]
-		}
-		listDir(dir, cfg, true)
-	case "-l":
-		dir := "."
-		if len(os.Args) > 2 {
-			dir = os.Args[2]
-		}
-		listDirLong(dir, cfg, false)
-	case "-al", "-la":
-		dir := "."
-		if len(os.Args) > 2 {
-			dir = os.Args[2]
-		}
-		listDirLong(dir, cfg, true)
+	cfg := loadConfig()
+	color := useColor()
+
+	switch cmd {
+	case "help":
+		printUsage()
+	case "version":
+		fmt.Println("customls " + version)
 	case "set":
-		dir := "."
-		if len(os.Args) > 2 {
-			dir = os.Args[2]
-		}
-		cfg = interactiveSet(dir, cfg)
+		cfg = interactiveSet(path, cfg)
 		fmt.Println()
-		listDir(dir, cfg, false)
+		if err := list(os.Stdout, path, cfg, listOpts{}, color, getTermWidth()); err != nil {
+			fmt.Fprintf(os.Stderr, "customls: %v\n", err)
+			os.Exit(1)
+		}
 	case "colors":
-		showColors(cfg)
+		showColors(os.Stdout, cfg, color)
 	case "order":
 		toggleOrder(cfg)
-	case "help", "--help", "-h":
-		printUsage()
 	default:
-		// Treat as a path
-		listDir(os.Args[1], cfg, false)
+		if err := list(os.Stdout, path, cfg, opts, color, getTermWidth()); err != nil {
+			fmt.Fprintf(os.Stderr, "customls: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
