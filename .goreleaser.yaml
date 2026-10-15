@@ -1,0 +1,42 @@
+version: 2
+
+builds:
+  - binary: customls
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "customls_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+brews:
+  - repository:
+      owner: JadenB9
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    name: customls
+    homepage: https://github.com/JadenB9/customls
+    description: ls replacement with per-file colors you pick yourself
+    license: MIT
+    install: |
+      bin.install "customls"
+    test: |
+      system "#{bin}/customls", "--version"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
